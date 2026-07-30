@@ -1073,4 +1073,3 @@ panel_a <- data.frame(
 
 cat("\n=== Table 4 Panel A: Discrimination Performance Across Settings ===\n")
 print(panel_a)
-                        
