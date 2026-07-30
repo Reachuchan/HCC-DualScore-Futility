@@ -1,8 +1,7 @@
 # ==============================================================================
 # Script Name: 00_table1_baseline_characteristics.R
-# Purpose: Clean and process baseline variables for the surgical resection cohort (n = 3,047)
-#          and the LRST comparator cohort (n = 711). Generate Table 1 (gtsummary) and 
-#          calculate reverse Kaplan-Meier median follow-up times for both cohorts.
+# Purpose: Baseline characteristics table (Table 1) and median follow-up estimation 
+#          for surgical resection and LRST comparator cohorts.
 # Outputs: Table1_Baseline_Characteristics.xlsx
 # Language: R (>= 4.0.0)
 # ==============================================================================
@@ -17,83 +16,161 @@ library(gtsummary)
 library(writexl)
 
 # ------------------------------------------------------------------------------
-# 2. Helper Functions for Data Cleaning and Feature Coercion
+# 2. Resection Cohort: Data Import and Feature Engineering (Original Pipeline)
 # ------------------------------------------------------------------------------
-clean_and_coerce <- function(data) {
-  data %>%
-    mutate(across(everything(), ~ ifelse(. %in% c(".", "NaN", " ", "", "NA", "null", "NULL"), NA_character_, as.character(.)))) %>%
-    mutate(across(any_of(c(
-      "age", "BMI", "PLT", "INR", "CR", "Bili", "Alb", "AST", "ALT", "AFP", "ALBI_score",
-      "Diameter_of_largest_tumour_nodule", "No_of_Tumour_Nodules", "No_of_Tumour_3",
-      "gender", "hbv", "hcv", "cirr", "DM", "HTN", "CAD", "CKD",
-      "Ascites", "Rad1VI", "death_clean", "O_event"
-    )), ~ suppressWarnings(as.numeric(.))))
-}
+df <- read_excel("HCC_futility _resection_analysis.xlsx")
+df <- df %>% distinct(across(all_of(setdiff(names(df), "sn"))), .keep_all = TRUE)
 
-prepare_vars <- function(data) {
-  data %>%
-    mutate(
-      Age_num          = age,
-      AFP_num          = AFP,
-      PLT_num          = PLT,
-      AST_num          = AST,
-      ALT_num          = ALT,
-      Alb_num          = Alb,
-      Bili_num         = Bili,
-      ALBI_num         = ALBI_score,
-      Tumor_Dim        = Diameter_of_largest_tumour_nodule,
-      
-      Male             = ifelse(!is.na(gender) & gender == 1, 1, 0),
-      HBV              = ifelse(!is.na(hbv) & hbv == 1, 1, 0),
-      HCV              = ifelse(!is.na(hcv) & hcv == 1, 1, 0),
-      Cirrhosis        = ifelse(!is.na(cirr) & cirr == 1, 1, 0),
-      Diabetes         = ifelse(!is.na(DM) & DM == 1, 1, 0),
-      Hypertension     = ifelse(!is.na(HTN) & HTN == 1, 1, 0),
-      Coronary_disease = ifelse(!is.na(CAD) & CAD == 1, 1, 0),
-      Chronic_kidney   = ifelse(!is.na(CKD) & CKD == 1, 1, 0),
-      Ascites_var      = ifelse(!is.na(Ascites) & Ascites == 1, 1, 0),
-      AFP_gt_400       = ifelse(!is.na(AFP_num) & AFP_num > 400, 1, 0),
-      Thrombocytopenia = ifelse(!is.na(PLT_num) & PLT_num < 100, 1, 0),
-      Multinodular     = ifelse(!is.na(No_of_Tumour_3) & No_of_Tumour_3 >= 2, 1, 0),
-      Rad_VI           = ifelse(!is.na(Rad1VI) & Rad1VI == 1, 1, 0),
-      BCLC_A           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("A", "1"), 1, 0),
-      BCLC_B           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("B", "2"), 1, 0),
-      BCLC_C           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("C", "3"), 1, 0),
-      Deaths           = ifelse(!is.na(death_clean) & death_clean == 1, 1, 0)
-    )
-}
+safe_names <- colnames(df)
+safe_names <- gsub(">=", "_gte_", safe_names)
+safe_names <- gsub("\\+", "_plus_", safe_names)
+safe_names <- gsub("\\.", "_", safe_names)
+safe_names <- gsub(" ", "_", safe_names)
+colnames(df) <- safe_names
+
+df_processed <- df %>%
+  # Clean pseudo-NA characters
+  mutate(across(everything(), ~ ifelse(. %in% c(".", "NaN", " ", "", "NA", "null", "NULL"), NA, .))) %>%
+  
+  # Coerce continuous endpoints and variables
+  mutate(across(c(RFS_time_5y, RFS_status_5y, OS_time_5y, OS_status_5y,
+                  age, BMI, PLT, INR, CR, Bili, Alb, AST, ALT, TBS, 
+                  Diameter_of_largest_tumour_nodule, No_of_Tumour_Nodules, InitVascLymphInvasion), as.numeric)) %>%
+  
+  # Feature Engineering
+  mutate(
+    log_PLT        = log(PLT + 1),
+    log_INR        = log(INR + 1),
+    log_CR         = log(CR + 1),
+    log_AST        = log(AST + 1),
+    log_ALT        = log(ALT + 1),
+    log_Bili       = log(Bili + 1),
+    log_Alb        = log(Alb + 1),
+    log_TBS        = log(TBS + 1),
+    log_Diameter   = log(Diameter_of_largest_tumour_nodule + 1),
+    log_Nodules    = log(No_of_Tumour_Nodules + 1),
+    logAFP_plus_1     = as.numeric(`log(AFP_plus_1)`),
+    No_of_Tumour_3    = as.numeric(as.character(No_of_Tumour_3)),
+    FIB4_index        = (age * AST) / (PLT * sqrt(ALT)),
+    log_FIB4          = log(FIB4_index + 1),
+    log_CR            = log(CR + 1),
+    log_INR           = log(INR + 1),
+    ALBI_score        = (log10(pmax(Bili, 1e-6)) * 0.66) + (Alb * -0.085),
+    Comorbidity_Count = (ifelse(CAD == 1, 1, 0) + ifelse(DM == 1, 1, 0) + ifelse(HTN == 1, 1, 0) + ifelse(CKD == 1, 1, 0)),
+    Centre            = as.factor(centre_x)
+  )
+
+# Define Endpoints
+df_resection <- df_processed %>%
+  mutate(
+    O_time  = RFS_time_5y,
+    O_event = RFS_status_5y,
+    S_time  = ifelse(RFS_status_5y == 1, RFS_time_5y, OS_time_5y),
+    S_event = ifelse(RFS_status_5y == 1, 0L, OS_status_5y)
+  )
+
+# Prepare Resection Table 1 Display Variables
+df_resection_prepared <- df_resection %>%
+  mutate(
+    Age_num          = age,
+    AFP_num          = suppressWarnings(as.numeric(as.character(AFP))),
+    PLT_num          = PLT,
+    AST_num          = AST,
+    ALT_num          = ALT,
+    Alb_num          = Alb,
+    Bili_num         = Bili,
+    ALBI_num         = ALBI_score,
+    Tumor_Dim        = Diameter_of_largest_tumour_nodule,
+    
+    Male             = ifelse(!is.na(gender) & gender == 1, 1, 0),
+    HBV              = ifelse(!is.na(hbv) & hbv == 1, 1, 0),
+    HCV              = ifelse(!is.na(hcv) & hcv == 1, 1, 0),
+    Cirrhosis        = ifelse(!is.na(cirr) & cirr == 1, 1, 0),
+    Diabetes         = ifelse(!is.na(DM) & DM == 1, 1, 0),
+    Hypertension     = ifelse(!is.na(HTN) & HTN == 1, 1, 0),
+    Coronary_disease = ifelse(!is.na(CAD) & CAD == 1, 1, 0),
+    Chronic_kidney   = ifelse(!is.na(CKD) & CKD == 1, 1, 0),
+    Ascites_var      = ifelse(!is.na(Ascites) & Ascites == 1, 1, 0),
+    AFP_gt_400       = ifelse(!is.na(AFP_num) & AFP_num > 400, 1, 0),
+    Thrombocytopenia = ifelse(!is.na(PLT_num) & PLT_num < 100, 1, 0),
+    Multinodular     = ifelse(!is.na(No_of_Tumour_3) & No_of_Tumour_3 >= 2, 1, 0),
+    Rad_VI           = ifelse(!is.na(Rad1VI) & Rad1VI == 1, 1, 0),
+    
+    BCLC_A           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("A", "1"), 1, 0),
+    BCLC_B           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("B", "2"), 1, 0),
+    BCLC_C           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("C", "3"), 1, 0),
+    
+    Deaths           = ifelse(!is.na(death_clean) & death_clean == 1, 1, 0),
+    Early_failure    = ifelse(!is.na(O_event) & O_event == 1, 1, 0)
+  )
 
 # ------------------------------------------------------------------------------
-# 3. Load and Process Surgical Resection Cohort
+# 3. LRST Cohort: Data Import and Feature Engineering (Original Pipeline)
 # ------------------------------------------------------------------------------
-df_resect_raw <- read_excel("HCC_futility_resection_analysis.xlsx")
-df_resect_raw <- df_resect_raw %>% distinct(across(all_of(setdiff(names(df_resect_raw), "sn"))), .keep_all = TRUE)
+df_LRST <- read_excel("HCC_futility_therapy_analysis.xlsx")
+df_LRST <- df_LRST %>% distinct(across(all_of(setdiff(names(df_LRST), "sn"))), .keep_all = TRUE)
 
-safe_names <- colnames(df_resect_raw)
-safe_names <- gsub(">=", "_gte_", safe_names); safe_names <- gsub("\\+", "_plus_", safe_names)
-safe_names <- gsub("\\.", "_", safe_names); safe_names <- gsub(" ", "_", safe_names)
-colnames(df_resect_raw) <- safe_names
+safe_names_lrst <- colnames(df_LRST)
+safe_names_lrst <- gsub(">=", "_gte_", safe_names_lrst)
+safe_names_lrst <- gsub("\\+", "_plus_", safe_names_lrst)
+safe_names_lrst <- gsub("\\.", "_", safe_names_lrst)
+safe_names_lrst <- gsub(" ", "_", safe_names_lrst)
+colnames(df_LRST) <- safe_names_lrst
 
-df_resect_clean <- clean_and_coerce(df_resect_raw)
-df_resection_prepared <- prepare_vars(df_resect_clean) %>%
-  mutate(Early_failure = ifelse(!is.na(O_event) & O_event == 1, 1, 0))
+df_lrst_processed <- df_LRST %>%
+  mutate(across(everything(), ~ ifelse(. %in% c(".", "NaN", " ", "", "NA", "null", "NULL"), NA, .))) %>%
+  mutate(across(c(age, PLT, gender, INR, CR, Bili, Alb, AST, ALT, 
+                  Diameter_of_largest_tumour_nodule, OS_time_5y, OS_status_5y,
+                  CAD, DM, HTN, CKD, Rad1VI, HBsAg, cirr, Ascites), ~ as.numeric(as.character(.)))) %>%
+  mutate(
+    log_Diameter      = log(Diameter_of_largest_tumour_nodule + 1),
+    logAFP_plus_1     = as.numeric(`log(AFP_plus_1)`),
+    No_of_Tumour_3    = as.numeric(as.character(No_of_Tumour_3)),
+    FIB4_index        = (age * AST) / (PLT * sqrt(ALT)),
+    log_FIB4          = log(FIB4_index + 1),
+    log_CR            = log(CR + 1),
+    log_INR           = log(INR + 1),
+    ALBI_score        = (log10(pmax(Bili, 1e-6)) * 0.66) + (Alb * -0.085),
+    Comorbidity_Count = (ifelse(CAD == 1, 1, 0) + ifelse(DM == 1, 1, 0) + ifelse(HTN == 1, 1, 0) + ifelse(CKD == 1, 1, 0)),
+    Centre            = as.factor(centre_x)
+  )
+
+# Prepare LRST Table 1 Display Variables
+df_lrst_prepared <- df_lrst_processed %>%
+  mutate(
+    Age_num          = age,
+    AFP_num          = suppressWarnings(as.numeric(as.character(AFP))),
+    PLT_num          = PLT,
+    AST_num          = AST,
+    ALT_num          = ALT,
+    Alb_num          = Alb,
+    Bili_num         = Bili,
+    ALBI_num         = ALBI_score,
+    Tumor_Dim        = Diameter_of_largest_tumour_nodule,
+    
+    Male             = ifelse(!is.na(gender) & gender == 1, 1, 0),
+    HBV              = ifelse(!is.na(hbv) & hbv == 1, 1, 0),
+    HCV              = ifelse(!is.na(hcv) & hcv == 1, 1, 0),
+    Cirrhosis        = ifelse(!is.na(cirr) & cirr == 1, 1, 0),
+    Diabetes         = ifelse(!is.na(DM) & DM == 1, 1, 0),
+    Hypertension     = ifelse(!is.na(HTN) & HTN == 1, 1, 0),
+    Coronary_disease = ifelse(!is.na(CAD) & CAD == 1, 1, 0),
+    Chronic_kidney   = ifelse(!is.na(CKD) & CKD == 1, 1, 0),
+    Ascites_var      = ifelse(!is.na(Ascites) & Ascites == 1, 1, 0),
+    AFP_gt_400       = ifelse(!is.na(AFP_num) & AFP_num > 400, 1, 0),
+    Thrombocytopenia = ifelse(!is.na(PLT_num) & PLT_num < 100, 1, 0),
+    Multinodular     = ifelse(!is.na(No_of_Tumour_3) & No_of_Tumour_3 >= 2, 1, 0),
+    Rad_VI           = ifelse(!is.na(Rad1VI) & Rad1VI == 1, 1, 0),
+    
+    BCLC_A           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("A", "1"), 1, 0),
+    BCLC_B           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("B", "2"), 1, 0),
+    BCLC_C           = ifelse(!is.na(BCLCStage) & toupper(as.character(BCLCStage)) %in% c("C", "3"), 1, 0),
+    
+    Deaths           = ifelse(!is.na(death_clean) & death_clean == 1, 1, 0)
+  )
 
 # ------------------------------------------------------------------------------
-# 4. Load and Process LRST Comparator Cohort
-# ------------------------------------------------------------------------------
-df_lrst_raw <- read_excel("HCC_futility_therapy_analysis.xlsx")
-df_lrst_raw <- df_lrst_raw %>% distinct(across(all_of(setdiff(names(df_lrst_raw), "sn"))), .keep_all = TRUE)
-
-safe_names_lrst <- colnames(df_lrst_raw)
-safe_names_lrst <- gsub(">=", "_gte_", safe_names_lrst); safe_names_lrst <- gsub("\\+", "_plus_", safe_names_lrst)
-safe_names_lrst <- gsub("\\.", "_", safe_names_lrst); safe_names_lrst <- gsub(" ", "_", safe_names_lrst)
-colnames(df_lrst_raw) <- safe_names_lrst
-
-df_lrst_clean <- clean_and_coerce(df_lrst_raw)
-df_lrst_prepared <- prepare_vars(df_lrst_clean)
-
-# ------------------------------------------------------------------------------
-# 5. Generate Cohort-Specific gtsummary Tables
+# 4. Generate and Export Table 1
 # ------------------------------------------------------------------------------
 tbl_resection <- df_resection_prepared %>%
   select(
@@ -181,9 +258,9 @@ table1_final <- tbl_merge(
   tab_spanner = c("**Resection**", "**LRST comparator**")
 ) %>% bold_labels()
 
-# Format and Export to Excel
-n_resection <- nrow(df_resect_clean)
-n_lrst      <- nrow(df_lrst_clean)
+# Export Excel
+n_resection <- nrow(df_resection)
+n_lrst      <- nrow(df_lrst_processed)
 
 stat_cols <- grep("^stat_", colnames(table1_final$table_body), value = TRUE)
 col_resection_title <- paste0("Resection (N=", n_resection, ")")
@@ -207,14 +284,18 @@ write_xlsx(df_table1_output, "Table1_Baseline_Characteristics.xlsx")
 cat(">> Table 1 successfully exported to Table1_Baseline_Characteristics.xlsx\n")
 
 # ------------------------------------------------------------------------------
-# 6. Reverse Kaplan-Meier Median Follow-up Estimation
+# 5. Reverse Kaplan-Meier Median Follow-up Estimation
 # ------------------------------------------------------------------------------
-fit_fu_df <- survfit(Surv(as.numeric(OS_time_raw), as.numeric(death_clean) == 0) ~ 1, data = df_resect_clean)
-fu_df <- summary(fit_fu_df)$table
-cat(sprintf("Resection Median Follow-up: %.1f days (95%% CI: %.1f–%.1f days)\n", 
-            fu_df["median"], fu_df["0.95LCL"], fu_df["0.95UCL"]))
+if ("OS_time_raw" %in% colnames(df_resection) && "death_clean" %in% colnames(df_resection)) {
+  fit_fu_df <- survfit(Surv(as.numeric(OS_time_raw), as.numeric(death_clean) == 0) ~ 1, data = df_resection)
+  fu_df <- summary(fit_fu_df)$table
+  cat(sprintf("Resection Median Follow-up: %.1f days (95%% CI: %.1f–%.1f days)\n", 
+              fu_df["median"], fu_df["0.95LCL"], fu_df["0.95UCL"]))
+}
 
-fit_fu_lrst <- survfit(Surv(as.numeric(OS_time_raw), as.numeric(death_clean) == 0) ~ 1, data = df_lrst_clean)
-fu_lrst <- summary(fit_fu_lrst)$table
-cat(sprintf("LRST Comparator Median Follow-up: %.1f days (95%% CI: %.1f–%.1f days)\n", 
-            fu_lrst["median"], fu_lrst["0.95LCL"], fu_lrst["0.95UCL"]))
+if ("OS_time_raw" %in% colnames(df_lrst_processed) && "death_clean" %in% colnames(df_lrst_processed)) {
+  fit_fu_lrst <- survfit(Surv(as.numeric(OS_time_raw), as.numeric(death_clean) == 0) ~ 1, data = df_lrst_processed)
+  fu_lrst <- summary(fit_fu_lrst)$table
+  cat(sprintf("LRST Comparator Median Follow-up: %.1f days (95%% CI: %.1f–%.1f days)\n", 
+              fu_lrst["median"], fu_lrst["0.95LCL"], fu_lrst["0.95UCL"]))
+}
