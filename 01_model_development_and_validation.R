@@ -986,6 +986,7 @@ print(supp_fig6)
 # ------------------------------------------------------------------------------
 # 15. Time-Dependent AUC and Panel Output Summary
 # ------------------------------------------------------------------------------
+dat_scored$Centre <- as.factor(df$centre_y)
 get_loco_lp_vec <- function(data, x_vars, time_var, event_var, lambda_val = 0.5) {
   lp_out <- rep(NA_real_, nrow(data))
   for (ctr in unique(data$Centre)) {
@@ -1073,3 +1074,36 @@ panel_a <- data.frame(
 
 cat("\n=== Table 4 Panel A: Discrimination Performance Across Settings ===\n")
 print(panel_a)
+                        
+
+panel_b <- bind_rows(
+  loco_o %>% mutate(Model_Track = "O-score (Recurrence Risk)"),
+  loco_s %>% mutate(Model_Track = "S-score (Non-recurrent Mortality)")
+) %>%
+  select(
+    Model_Track,
+    Centre_ID = Centre,
+    Total_Patients = n_total,
+    Observed_Events = n_events,
+    LOCO_C_index_95CI = C_index_CI,
+    High_Risk_Patients = n_high
+  )
+panel_b <- bind_rows(
+  loco_o %>% mutate(Model_Track = "O-score (Recurrence Risk)"),
+  loco_s %>% mutate(Model_Track = "S-score (Non-recurrent Mortality)")
+) %>%
+  mutate(
+    LOCO_C_index_95CI = sprintf("%.3f (%.3f-%.3f)", C_index, C_lower, C_upper)
+  ) %>%
+  select(
+    `Model Track`                      = Model_Track,
+    `Centre ID`                        = Centre,
+    `Total Patients (n)`               = n_total,
+    `Observed Events (n)`              = n_events,
+    `LOCO C-index (95% CI)`            = LOCO_C_index_95CI,
+    `Predicted High-Risk Patients (n)`  = n_high
+  )
+print(panel_b)
+
+# write_xlsx(panel_a, path = "Table_4_PanelA.xlsx")
+# write_xlsx(panel_b, path = "Supplementary_Table_S8.xlsx")
