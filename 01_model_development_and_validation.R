@@ -256,45 +256,64 @@ var_labels <- c(
   "Comorbidity_Count" = "Cumulative comorbidity count (0–4)"
 )
 
+# Core function: Extract beta, SE, HR, 95% CI (Percentile Bootstrap), and p-values from Ridge Cox model
 get_ridge_table_stats <- function(data, x_vars, time_var, event_var, lambda_val = 0.5, B = 200, seed = 2026) {
   X <- data.matrix(data[, x_vars, drop = FALSE])
   y <- Surv(data[[time_var]], data[[event_var]])
   
+  # Standardize features and calculate point estimates
   ctr <- colMeans(X, na.rm = TRUE)
   sds <- apply(X, 2, sd, na.rm = TRUE); sds[sds == 0] <- 1
   X_sc <- sweep(sweep(X, 2, ctr, "-"), 2, sds, "/")
   
   fit_main <- glmnet(X_sc, y, family = "cox", alpha = 0, lambda = lambda_val, standardize = FALSE)
   beta_sc  <- as.numeric(coef(fit_main))
-  beta_raw <- beta_sc / sds
+  beta_raw <- beta_sc / sds  # Scale back to raw-scale beta
   
+  # Stratified Bootstrap
   set.seed(seed)
-  n <- nrow(data)
-  boot_betas <- matrix(NA, nrow = B, ncol = length(x_vars))
+  idx_events    <- which(data[[event_var]] == 1)
+  idx_nonevents <- which(data[[event_var]] == 0)
+  
+  boot_betas_raw <- matrix(NA, nrow = B, ncol = length(x_vars))
   
   for (b in seq_len(B)) {
-    idx <- sample(n, n, replace = TRUE)
+    boot_events    <- sample(idx_events, size = length(idx_events), replace = TRUE)
+    boot_nonevents <- sample(idx_nonevents, size = length(idx_nonevents), replace = TRUE)
+    idx            <- c(boot_events, boot_nonevents)
+    
     X_b <- X[idx, , drop = FALSE]
     y_b <- y[idx]
     
     ctr_b <- colMeans(X_b, na.rm = TRUE)
-    sds_b <- apply(X_b, 2, sd, na.rm = TRUE); sds_b[sds_b == 0] <- 1
-    X_b_sc <- sweep(sweep(X_b, 2, ctr_b, "-"), 2, sds_b, "/")
+    sds_b <- apply(X_b, 2, sd, na.rm = TRUE)
     
-    fit_b <- tryCatch(glmnet(X_b_sc, y_b, family = "cox", alpha = 0, lambda = lambda_val, standardize = FALSE), error = function(e) NULL)
+    if (any(sds_b == 0)) {
+      boot_betas_raw[b, ] <- NA
+      next
+    }
+    
+    X_b_sc <- sweep(sweep(X_b, 2, ctr_b, "-"), 2, sds_b, "/")
+    fit_b  <- tryCatch(glmnet(X_b_sc, y_b, family = "cox", alpha = 0, lambda = lambda_val, standardize = FALSE), error = function(e) NULL)
+    
     if (!is.null(fit_b)) {
-      boot_betas[b, ] <- as.numeric(coef(fit_b)) / sds_b
+      boot_betas_raw[b, ] <- as.numeric(coef(fit_b)) / sds_b
     }
   }
   
-  se_vec <- apply(boot_betas, 2, sd, na.rm = TRUE)
+  # Calculate Bootstrap Standard Error & Wald p-values
+  se_vec <- apply(boot_betas_raw, 2, sd, na.rm = TRUE)
   se_vec[se_vec == 0 | is.na(se_vec)] <- 0.001
-  
   z_scores <- beta_raw / se_vec
   p_vals   <- 2 * (1 - pnorm(abs(z_scores)))
-  hr_val   <- exp(beta_raw)
-  hr_lo    <- exp(beta_raw - 1.96 * se_vec)
-  hr_hi    <- exp(beta_raw + 1.96 * se_vec)
+  
+  # Calculate 95% Confidence Intervals using Percentile Bootstrap
+  ci_lo_beta <- apply(boot_betas_raw, 2, quantile, probs = 0.025, na.rm = TRUE)
+  ci_hi_beta <- apply(boot_betas_raw, 2, quantile, probs = 0.975, na.rm = TRUE)
+  
+  hr_val <- exp(beta_raw)
+  hr_lo  <- exp(ci_lo_beta)
+  hr_hi  <- exp(ci_hi_beta)
   
   res_df <- data.frame(
     Variable = x_vars,
@@ -305,50 +324,88 @@ get_ridge_table_stats <- function(data, x_vars, time_var, event_var, lambda_val 
     p_val    = ifelse(p_vals < 0.001, "<0.001", sprintf("%.3f", p_vals)),
     stringsAsFactors = FALSE
   )
+  
   res_df$Variable <- ifelse(res_df$Variable %in% names(var_labels), var_labels[res_df$Variable], res_df$Variable)
   n_events <- sum(data[[event_var]] == 1, na.rm = TRUE)
   
   list(df = res_df, n_events = n_events)
 }
 
+# Calculate statistics for O-score and S-score
 res_o_ridge <- get_ridge_table_stats(dat_scored, O_VARS, "O_time", "O_event", lambda_val = 0.5)
 res_s_ridge <- get_ridge_table_stats(dat_scored, S_VARS, "S_time", "S_event", lambda_val = 0.5)
 
+# Assemble Table 2
 header_o <- data.frame(Variable = "O-score (recurrence)", beta = "", SE = "", HR = "", CI_95 = "", p_val = "", stringsAsFactors = FALSE)
 header_s <- data.frame(Variable = "S-score (non-recurrent mortality)", beta = "", SE = "", HR = "", CI_95 = "", p_val = "", stringsAsFactors = FALSE)
 
-Table2_Ridge <- bind_rows(header_o, res_o_ridge$df, header_s, res_s_ridge$df)
+Table2_Ridge <- bind_rows(
+  header_o,
+  res_o_ridge$df,
+  header_s,
+  res_s_ridge$df
+)
+
 colnames(Table2_Ridge) <- c("Variable", "β", "SE", "HR", "95% CI", "p-value")
 
-cat("\n=== Table 2. Dual-score Cox model coefficients ===\n")
+cat("\n=== Table 2. Dual-score Cox model coefficients ===\n\n")
 print(Table2_Ridge, row.names = FALSE)
 
 # ------------------------------------------------------------------------------
 # 7. Baseline Hazard and Risk Score Calculations
 # ------------------------------------------------------------------------------
+cat("\n══ Calculating 5-year predicted survival rate distributions and cutoffs... ══\n\n")
+
+# Linear predictor for O-score (Recurrence)
 Xo <- data.matrix(dat_scored[, O_VARS])
-for(j in seq_len(ncol(Xo))) Xo[is.na(Xo[,j]),j] <- median(Xo[,j], na.rm=TRUE)
-ctr_o <- colMeans(Xo); sd_o <- apply(Xo,2,sd); sd_o[sd_o==0] <- 1
-Xo_sc <- sweep(sweep(Xo,2,ctr_o,"-"),2,sd_o,"/")
-fit_o <- glmnet(Xo_sc, Surv(dat_scored$O_time, dat_scored$O_event), family="cox", alpha=0, lambda=0.5, standardize=FALSE)
+for (j in seq_len(ncol(Xo))) Xo[is.na(Xo[, j]), j] <- median(Xo[, j], na.rm = TRUE)
+ctr_o <- colMeans(Xo); sd_o <- apply(Xo, 2, sd); sd_o[sd_o == 0] <- 1
+Xo_sc <- sweep(sweep(Xo, 2, ctr_o, "-"), 2, sd_o, "/")
+fit_o <- glmnet(Xo_sc, Surv(dat_scored$O_time, dat_scored$O_event), family = "cox", alpha = 0, lambda = 0.5, standardize = FALSE)
 dat_scored$O_lp <- as.numeric(Xo_sc %*% coef(fit_o))
 
+# Linear predictor for S-score (Non-recurrent mortality)
 Xs <- data.matrix(dat_scored[, S_VARS])
-for(j in seq_len(ncol(Xs))) Xs[is.na(Xs[,j]),j] <- median(Xs[,j], na.rm=TRUE)
-ctr_s <- colMeans(Xs); sd_s <- apply(Xs,2,sd); sd_s[sd_s==0] <- 1
-Xs_sc <- sweep(sweep(Xs,2,ctr_s,"-"),2,sd_s,"/")
-fit_s <- glmnet(Xs_sc, Surv(dat_scored$S_time, dat_scored$S_event), family="cox", alpha=0, lambda=0.5, standardize=FALSE)
+for (j in seq_len(ncol(Xs))) Xs[is.na(Xs[, j]), j] <- median(Xs[, j], na.rm = TRUE)
+ctr_s <- colMeans(Xs); sd_s <- apply(Xs, 2, sd); sd_s[sd_s == 0] <- 1
+Xs_sc <- sweep(sweep(Xs, 2, ctr_s, "-"), 2, sd_s, "/")
+fit_s <- glmnet(Xs_sc, Surv(dat_scored$S_time, dat_scored$S_event), family = "cox", alpha = 0, lambda = 0.5, standardize = FALSE)
 dat_scored$S_lp <- as.numeric(Xs_sc %*% coef(fit_s))
 
-t5yr <- 1826.25
-bh_o <- basehaz(coxph(Surv(O_time,O_event)~offset(O_lp), data=dat_scored[dat_scored$O_time>0,], ties="efron"), centered=FALSE)
-bh_s <- basehaz(coxph(Surv(S_time,S_event)~offset(S_lp), data=dat_scored[dat_scored$S_time>0,], ties="efron"), centered=FALSE)
-h0_o <- max(bh_o$hazard[bh_o$time <= t5yr], na.rm=TRUE)
-h0_s <- max(bh_s$hazard[bh_s$time <= t5yr], na.rm=TRUE)
+# Breslow baseline hazard estimation for 5-year predicted survival probabilities
+t5yr <- ifelse(max(dat_scored$O_time, na.rm = TRUE) > 100, 1826.25, 5)
+
+bh_o <- basehaz(coxph(Surv(O_time, O_event) ~ offset(O_lp), data = dat_scored[dat_scored$O_time > 0, ], ties = "efron"), centered = FALSE)
+bh_s <- basehaz(coxph(Surv(S_time, S_event) ~ offset(S_lp), data = dat_scored[dat_scored$S_time > 0, ], ties = "efron"), centered = FALSE)
+h0_o <- max(bh_o$hazard[bh_o$time <= t5yr], na.rm = TRUE)
+h0_s <- max(bh_s$hazard[bh_s$time <= t5yr], na.rm = TRUE)
 
 dat_scored <- dat_scored %>%
-  mutate(pred_O_5yr = exp(-h0_o * exp(O_lp)),
-         pred_S_5yr = exp(-h0_s * exp(S_lp)))
+  mutate(
+    pred_O_5yr = exp(-h0_o * exp(O_lp)),
+    pred_S_5yr = exp(-h0_s * exp(S_lp))
+  )
+
+# Summarize distribution and risk cutoffs
+calc_results <- data.frame(
+  Endpoint = c("5-year RFS (O-score)", "5-year Non-recurrent Survival (S-score)"),
+  Median   = c(
+    sprintf("%.1f%%", median(dat_scored$pred_O_5yr, na.rm = TRUE) * 100),
+    sprintf("%.1f%%", median(dat_scored$pred_S_5yr, na.rm = TRUE) * 100)
+  ),
+  IQR      = c(
+    sprintf("%.1f%%–%.1f%%", quantile(dat_scored$pred_O_5yr, 0.25, na.rm = TRUE) * 100, quantile(dat_scored$pred_O_5yr, 0.75, na.rm = TRUE) * 100),
+    sprintf("%.1f%%–%.1f%%", quantile(dat_scored$pred_S_5yr, 0.25, na.rm = TRUE) * 100, quantile(dat_scored$pred_S_5yr, 0.75, na.rm = TRUE) * 100)
+  ),
+  Cutoff   = c(
+    sprintf("%.1f%% (30th percentile)", quantile(dat_scored$pred_O_5yr, 0.30, na.rm = TRUE) * 100),
+    sprintf("%.1f%% (15th percentile)", quantile(dat_scored$pred_S_5yr, 0.15, na.rm = TRUE) * 100)
+  ),
+  stringsAsFactors = FALSE
+)
+
+cat("[5-Year Predicted Survival Distribution & Cutoffs]:\n\n")
+print(calc_results, row.names = FALSE)
 
 coef_tbl_o <- data.frame(Variable = O_VARS, Coefficient = as.numeric(coef(fit_o)))
 coef_tbl_s <- data.frame(Variable = S_VARS, Coefficient = as.numeric(coef(fit_s)))
@@ -377,30 +434,41 @@ generate_tripod_model_card <- function(data, x_vars, time_var, event_var, fit_gl
   y     <- Surv(data[[time_var]], data[[event_var]])
   n     <- nrow(data)
   
-  sds <- apply(X_raw, 2, sd, na.rm = TRUE); sds[sds == 0] <- 1
+  means <- colMeans(X_raw, na.rm = TRUE)
+  sds   <- apply(X_raw, 2, sd, na.rm = TRUE); sds[sds == 0] <- 1
+  
   beta_sc  <- as.numeric(coef(fit_glmnet))
   beta_raw <- beta_sc / sds
-  hr_point <- exp(beta_raw)
+  centering_C <- sum(beta_sc * means / sds)
   
+  # Stratified Bootstrap
   set.seed(seed)
-  boot_betas <- matrix(NA, nrow = B, ncol = length(x_vars))
+  boot_betas    <- matrix(NA, nrow = B, ncol = length(x_vars))
   idx_events    <- which(data[[event_var]] == 1)
   idx_nonevents <- which(data[[event_var]] == 0)
-  n_events      <- length(idx_events)
-  n_nonevents   <- length(idx_nonevents)
   
   for (b in seq_len(B)) {
-    boot_events    <- sample(idx_events, size = n_events, replace = TRUE)
-    boot_nonevents <- sample(idx_nonevents, size = n_nonevents, replace = TRUE)
+    boot_events    <- sample(idx_events, size = length(idx_events), replace = TRUE)
+    boot_nonevents <- sample(idx_nonevents, size = length(idx_nonevents), replace = TRUE)
     idx            <- c(boot_events, boot_nonevents)
     
-    X_b <- X_raw[idx, , drop = FALSE]; y_b <- y[idx]
-    ctr_b <- colMeans(X_b, na.rm = TRUE)
-    sds_b <- apply(X_b, 2, sd, na.rm = TRUE); sds_b[sds_b == 0] <- 1
-    X_b_sc <- sweep(sweep(X_b, 2, ctr_b, "-"), 2, sds_b, "/")
+    X_b <- X_raw[idx, , drop = FALSE]
+    y_b <- y[idx]
     
-    fit_b <- tryCatch(glmnet(X_b_sc, y_b, family = "cox", alpha = 0, lambda = lambda_val, standardize = FALSE), error = function(e) NULL)
-    if (!is.null(fit_b)) boot_betas[b, ] <- as.numeric(coef(fit_b)) / sds_b
+    ctr_b <- colMeans(X_b, na.rm = TRUE)
+    sds_b <- apply(X_b, 2, sd, na.rm = TRUE)
+    
+    if (any(sds_b == 0)) {
+      boot_betas[b, ] <- NA
+      next
+    }
+    
+    X_b_sc <- sweep(sweep(X_b, 2, ctr_b, "-"), 2, sds_b, "/")
+    fit_b  <- tryCatch(glmnet(X_b_sc, y_b, family = "cox", alpha = 0, lambda = lambda_val, standardize = FALSE), error = function(e) NULL)
+    
+    if (!is.null(fit_b)) {
+      boot_betas[b, ] <- as.numeric(coef(fit_b)) / sds_b
+    }
   }
   
   ci_lo_beta <- apply(boot_betas, 2, quantile, probs = 0.025, na.rm = TRUE)
@@ -409,32 +477,48 @@ generate_tripod_model_card <- function(data, x_vars, time_var, event_var, fit_gl
   ci_hi_hr   <- exp(ci_hi_beta)
   
   var_clean_names <- c(
-    "log_Diameter" = "Tumour diameter", "No_of_Tumour_3" = "Tumour number", "Rad1VI" = "Radiologic vascular invasion",
-    "HBsAg" = "Chronic HBV", "cirr" = "Cirrhosis", "logAFP_plus_1" = "Serum AFP", "log_FIB4" = "FIB-4 index",
-    "log_CR" = "Serum creatinine", "log_INR" = "INR", "ALBI_score" = "ALBI score", "Ascites" = "Ascites",
+    "log_Diameter"      = "Tumour diameter",
+    "No_of_Tumour_3"    = "Tumour number",
+    "Rad1VI"            = "Radiologic vascular invasion",
+    "HBsAg"             = "Chronic HBV",
+    "cirr"              = "Cirrhosis",
+    "logAFP_plus_1"     = "Serum AFP",
+    "log_FIB4"          = "FIB-4 index",
+    "log_CR"            = "Serum creatinine",
+    "log_INR"           = "INR",
+    "ALBI_score"        = "ALBI score",
+    "Ascites"           = "Ascites",
     "Comorbidity_Count" = "Comorbidity count"
   )
   
   top_table <- data.frame(
-    `Predictor`        = ifelse(x_vars %in% names(var_clean_names), var_clean_names[x_vars], x_vars),
-    `Coding`           = ifelse(x_vars %in% names(coding_dict), coding_dict[x_vars], x_vars),
-    `β`                = sprintf("%.4f", beta_raw),
-    `HR`               = sprintf("%.2f", hr_point),
-    `Bootstrap 95% CI` = sprintf("%.2f–%.2f", ci_lo_hr, ci_hi_hr),
-    check.names = FALSE, stringsAsFactors = FALSE
+    `Predictor`           = ifelse(x_vars %in% names(var_clean_names), var_clean_names[x_vars], x_vars),
+    `Coding`              = ifelse(x_vars %in% names(coding_dict), coding_dict[x_vars], x_vars),
+    `Mean (μ)`            = sprintf("%.4f", means),
+    `SD (σ)`              = sprintf("%.4f", sds),
+    `Raw coefficient (β)` = sprintf("%.4f", beta_raw),
+    `HR`                  = sprintf("%.2f", exp(beta_raw)),
+    `Bootstrap 95% CI`    = sprintf("%.2f–%.2f", ci_lo_hr, ci_hi_hr),
+    check.names           = FALSE,
+    stringsAsFactors      = FALSE
   )
   
-  lp_raw <- as.numeric(X_raw %*% beta_raw)
-  sub_data <- data; sub_data$lp_raw_calc <- lp_raw
+  X_sc <- sweep(sweep(X_raw, 2, means, "-"), 2, sds, "/")
+  lp_std <- as.numeric(X_sc %*% beta_sc)
+  
+  sub_data <- data
+  sub_data$lp_std <- lp_std
   sub_data <- sub_data %>% filter(!is.na(.data[[time_var]]) & .data[[time_var]] > 0 & !is.na(.data[[event_var]]))
   
-  fit_cox_offset <- coxph(Surv(sub_data[[time_var]], sub_data[[event_var]]) ~ offset(lp_raw_calc), data = sub_data, ties = "efron")
+  fit_cox_offset <- coxph(Surv(sub_data[[time_var]], sub_data[[event_var]]) ~ offset(lp_std), data = sub_data, ties = "efron")
   bh <- basehaz(fit_cox_offset, centered = FALSE)
   
   max_t <- max(sub_data[[time_var]], na.rm = TRUE)
   target_days <- if (max_t > 100) c(730.5, 1095.75, 1826.25) else c(2.0, 3.0, 5.0)
   horizons    <- c("2y", "3y", "5y")
-  h0_vals <- numeric(3); s0_vals <- numeric(3)
+  
+  h0_vals <- numeric(3)
+  s0_vals <- numeric(3)
   
   for (i in seq_along(target_days)) {
     t_target <- target_days[i]
@@ -445,22 +529,94 @@ generate_tripod_model_card <- function(data, x_vars, time_var, event_var, fit_gl
   }
   
   bottom_table <- data.frame(
-    `Horizon` = horizons, `H0(t)` = sprintf("%.6f", h0_vals), `S0(t)` = sprintf("%.6f", s0_vals),
+    `Horizon`   = horizons,
+    `H0(t)`     = sprintf("%.6f", h0_vals),
+    `S0(t)`     = sprintf("%.6f", s0_vals),
     check.names = FALSE
   )
-  list(top = top_table, bottom = bottom_table, n_total = nrow(sub_data), n_events = sum(sub_data[[event_var]] == 1, na.rm = TRUE))
+  
+  list(
+    top         = top_table,
+    bottom      = bottom_table,
+    centering_C = centering_C,
+    n_total     = nrow(sub_data),
+    n_events    = sum(sub_data[[event_var]] == 1, na.rm = TRUE)
+  )
 }
+
+stopifnot(all(rownames(coef(fit_o)) == O_VARS))
+stopifnot(all(rownames(coef(fit_s)) == S_VARS))
 
 card_o_final <- generate_tripod_model_card(dat_scored, O_VARS, "O_time", "O_event", fit_o, lambda_val = 0.5)
 card_s_final <- generate_tripod_model_card(dat_scored, S_VARS, "S_time", "S_event", fit_s, lambda_val = 0.5)
 
-cat("\n=== Supplementary Table S1: O-score Model Card ===\n")
+# Console Output: Supplementary Table S1 (O-score)
+cat("====================================================================================================\n")
+cat("Supplementary Table S1. O-score (oncological futility) model card.\n")
+cat(sprintf("Final model specification with bootstrap-derived confidence intervals (n=%d resected patients, %d events).\n", 
+            card_o_final$n_total, card_o_final$n_events))
+cat("----------------------------------------------------------------------------------------------------\n")
+cat("Calculation formula for an external patient:\n")
+cat(sprintf("  η = ∑ ( Back-transformed β_raw_i * x_i ) - C, where Centering Constant C = %.4f\n", card_o_final$centering_C))
+cat(sprintf("  Predicted 5-year RFS = S0(5y)^exp(η), where S0(5y) = %s\n", card_o_final$bottom$`S0(t)`[3]))
+cat("----------------------------------------------------------------------------------------------------\n\n")
 print(card_o_final$top, row.names = FALSE)
+cat("\nBaseline cumulative hazard and survival estimated using Breslow's estimator:\n\n")
 print(card_o_final$bottom, row.names = FALSE)
 
-cat("\n=== Supplementary Table S2: S-score Model Card ===\n")
+# Console Output: Supplementary Table S2 (S-score)
+cat("\n====================================================================================================\n")
+cat("Supplementary Table S2. S-score (surgical futility) model card.\n")
+cat(sprintf("Final model specification with bootstrap-derived confidence intervals (n=%d resected patients, %d events).\n", 
+            card_s_final$n_total, card_s_final$n_events))
+cat("----------------------------------------------------------------------------------------------------\n")
+cat("Calculation formula for an external patient:\n")
+cat(sprintf("  η = ∑ ( Back-transformed β_raw_i * x_i ) - C, where Centering Constant C = %.4f\n", card_s_final$centering_C))
+cat(sprintf("  Predicted 5-year non-recurrent survival = S0(5y)^exp(η), where S0(5y) = %s\n", card_s_final$bottom$`S0(t)`[3]))
+cat("----------------------------------------------------------------------------------------------------\n\n")
 print(card_s_final$top, row.names = FALSE)
+cat("\nBaseline cumulative hazard and survival estimated using Breslow's estimator:\n\n")
 print(card_s_final$bottom, row.names = FALSE)
+cat("====================================================================================================\n")
+
+# Build & Export Aligned Excel Files
+build_aligned_table <- function(card) {
+  top_df <- card$top
+  cols <- colnames(top_df)
+  n_cols <- length(cols)
+  
+  blank_row <- function() setNames(as.data.frame(matrix("", nrow = 1, ncol = n_cols)), cols)
+  
+  p1_title <- setNames(data.frame(matrix(c("Part 1. Model coefficients", rep("", n_cols - 1)), nrow = 1)), cols)
+  p1_data  <- top_df
+  
+  p2_title  <- setNames(data.frame(matrix(c("Part 2. Baseline survival parameters", rep("", n_cols - 1)), nrow = 1)), cols)
+  p2_header <- setNames(data.frame(matrix(c("Prediction horizon (years)", "Baseline cumulative hazard H0(t)", "Baseline survival S0(t)", rep("", n_cols - 3)), nrow = 1)), cols)
+  
+  p2_body <- card$bottom[, 1:3]
+  p2_body[, 4:n_cols] <- ""
+  p2_body <- setNames(p2_body, cols)
+  
+  p3_title <- setNames(data.frame(matrix(c(sprintf("Centering Constant C = %.4f", card$centering_C), rep("", n_cols - 1)), nrow = 1)), cols)
+  p3_formula <- setNames(data.frame(matrix(c(sprintf("Formula: η = ∑(Raw_β * x) - %.4f | Predicted 5y RFS = (%.4f)^exp(η)", 
+                                                     card$centering_C, 
+                                                     as.numeric(card$bottom$`S0(t)`[card$bottom$Horizon == "5y"])), 
+                                             rep("", n_cols - 1)), nrow = 1)), cols)
+  
+  bind_rows(
+    p1_title, p1_data, 
+    blank_row(), 
+    p2_title, p2_header, p2_body, 
+    blank_row(), 
+    p3_title, p3_formula
+  )
+}
+
+if (requireNamespace("writexl", quietly = TRUE)) {
+  writexl::write_xlsx(build_aligned_table(card_o_final), "Supp_Table_S1_O_score_Aligned.xlsx")
+  writexl::write_xlsx(build_aligned_table(card_s_final), "Supp_Table_S2_S_score_Aligned.xlsx")
+  cat("\n✓ Excel Supplementary Tables S1 and S2 exported successfully.\n")
+}
 
 # ------------------------------------------------------------------------------
 # 9. Quadrant Classification and Summary Analysis
@@ -468,74 +624,109 @@ print(card_s_final$bottom, row.names = FALSE)
 O_pct_cutoff <- 0.30
 S_pct_cutoff <- 0.15
 
-O_cutoff_pct <- quantile(dat_scored$pred_O_5yr, O_pct_cutoff, na.rm=TRUE)
-S_cutoff_pct <- quantile(dat_scored$pred_S_5yr, S_pct_cutoff, na.rm=TRUE)
-O_cutoff_abs <- O_cutoff_pct
-S_cutoff_abs <- S_cutoff_pct
+O_cutoff_abs <- quantile(dat_scored$pred_O_5yr, O_pct_cutoff, na.rm = TRUE)
+S_cutoff_abs <- quantile(dat_scored$pred_S_5yr, S_pct_cutoff, na.rm = TRUE)
+
+cat(sprintf("\n── Quadrant Cutoffs (Pragmatic, derived from baseline cohort):\n"))
+cat(sprintf("   O-score 30th pct cutoff: pred_O_5yr < %.4f (%.1f%% 5-yr RFS)\n", O_cutoff_abs, O_cutoff_abs * 100))
+cat(sprintf("   S-score 15th pct cutoff: pred_S_5yr < %.4f (%.1f%% 5-yr non-rec survival)\n", S_cutoff_abs, S_cutoff_abs * 100))
 
 dat_scored <- dat_scored %>%
   mutate(
     high_O = as.integer(pred_O_5yr < O_cutoff_abs),
     high_S = as.integer(pred_S_5yr < S_cutoff_abs),
     quadrant = case_when(
-      high_O==0 & high_S==0 ~ "Low-O / Low-S",
-      high_O==1 & high_S==0 ~ "High-O / Low-S",
-      high_O==0 & high_S==1 ~ "Low-O / High-S",
-      high_O==1 & high_S==1 ~ "High-O / High-S",
+      high_O == 0 & high_S == 0 ~ "Low-O / Low-S",
+      high_O == 1 & high_S == 0 ~ "High-O / Low-S",
+      high_O == 0 & high_S == 1 ~ "Low-O / High-S",
+      high_O == 1 & high_S == 1 ~ "High-O / High-S",
       TRUE ~ NA_character_
     ),
-    quadrant = factor(quadrant, levels=c("Low-O / Low-S","High-O / Low-S","Low-O / High-S","High-O / High-S"))
+    quadrant = factor(quadrant, levels = c("Low-O / Low-S", "High-O / Low-S", "Low-O / High-S", "High-O / High-S"))
   )
+
+# Determine evaluation time horizon (Days vs Years)
+max_t <- max(c(dat_scored$O_time, dat_scored$S_time, dat_scored$OS_time_5y), na.rm = TRUE)
+t_5yr <- ifelse(max_t > 100, 1826.25, 5)
 
 target_cause_O <- 1
 target_cause_S <- if (2 %in% unique(dat_scored$S_event)) 2 else 1
 
-get_cif_at_5yr <- function(time_vec, event_vec, target_cause, t_target) {
-  if (!any(event_vec == target_cause, na.rm = TRUE)) return(0)
-  ci <- tryCatch(cuminc(ftime = time_vec, fstatus = event_vec, cencode = 0), error = function(e) NULL)
-  if (is.null(ci)) return(0)
-  curve_keys <- setdiff(names(ci), "Tests")
-  if (length(curve_keys) == 0) return(0)
-  
-  matching_key <- NULL
-  for (k in curve_keys) {
-    tokens <- unlist(strsplit(k, " "))
-    if (tokens[length(tokens)] == as.character(target_cause)) { matching_key <- k; break }
-  }
-  if (is.null(matching_key) && length(curve_keys) == 1) matching_key <- curve_keys[1]
-  if (is.null(matching_key)) return(0)
-  
-  t_vals <- ci[[matching_key]]$time
-  est_vals <- ci[[matching_key]]$est
-  idx <- max(which(t_vals <= t_target))
-  if (is.finite(idx) && idx > 0) return(est_vals[idx] * 100) else return(0)
-}
+# Construct unified competing status: 0 = censored, 1 = recurrence, 2 = non-recurrent death
+dat_scored <- dat_scored %>%
+  mutate(
+    comp_status_5y = case_when(
+      O_event == 1 ~ 1,
+      S_event == 1 ~ 2,
+      TRUE ~ 0
+    )
+  )
 
+# Unified competing risks model fitting across all quadrants
+cuminc_all <- cuminc(
+  ftime   = dat_scored$O_time,
+  fstatus = dat_scored$comp_status_5y,
+  group   = dat_scored$quadrant,
+  cencode = 0
+)
+
+# Global hypothesis tests across quadrants
+surv_diff <- survdiff(Surv(OS_time_5y, OS_status_5y) ~ quadrant, data = dat_scored)
+p_os_overall <- 1 - pchisq(surv_diff$chisq, length(surv_diff$n) - 1)
+
+cuminc_o_all <- cuminc(ftime = dat_scored$O_time, fstatus = dat_scored$O_event, group = dat_scored$quadrant, cencode = 0)
+p_cif_rec_overall <- if (!is.null(cuminc_o_all$Tests)) cuminc_o_all$Tests[min(target_cause_O, nrow(cuminc_o_all$Tests)), "pv"] else NA
+
+cuminc_s_all <- cuminc(ftime = dat_scored$S_time, fstatus = dat_scored$S_event, group = dat_scored$quadrant, cencode = 0)
+p_cif_nonrec_overall <- if (!is.null(cuminc_s_all$Tests)) cuminc_s_all$Tests[min(target_cause_S, nrow(cuminc_s_all$Tests)), "pv"] else NA
+
+# Assemble quadrant summary table
 quad_summary_final <- data.frame()
-t_5yr <- ifelse(max(c(dat_scored$O_time, dat_scored$S_time, dat_scored$OS_time_5y), na.rm = TRUE) > 100, 1826.25, 5)
 
 for (q in levels(dat_scored$quadrant)) {
   d_q <- dat_scored %>% filter(quadrant == q)
   n_q <- nrow(d_q)
   pct_q <- n_q / nrow(dat_scored) * 100
   
+  # Kaplan-Meier 5-year OS
   fit_os <- survfit(Surv(OS_time_5y, OS_status_5y) ~ 1, data = d_q)
   sum_os <- summary(fit_os, times = t_5yr)
-  os_5yr <- if (length(sum_os$surv) > 0) sum_os$surv * 100 else NA
+  
+  os_5yr   <- if (length(sum_os$surv) > 0) sum_os$surv * 100 else NA
   os_lower <- if (length(sum_os$lower) > 0) sum_os$lower * 100 else NA
   os_upper <- if (length(sum_os$upper) > 0) sum_os$upper * 100 else NA
   
-  cif_rec <- get_cif_at_5yr(d_q$O_time, d_q$O_event, target_cause = target_cause_O, t_target = t_5yr)
-  cif_nonrec <- get_cif_at_5yr(d_q$S_time, d_q$S_event, target_cause = target_cause_S, t_target = t_5yr)
+  # Extract 5-year CIF from unified competing risks model
+  key_rec <- paste(q, 1)
+  cif_rec <- if (key_rec %in% names(cuminc_all)) {
+    idx <- max(which(cuminc_all[[key_rec]]$time <= t_5yr))
+    if (is.finite(idx) && idx > 0) cuminc_all[[key_rec]]$est[idx] * 100 else 0
+  } else 0
+  
+  key_nonrec <- paste(q, 2)
+  cif_nonrec <- if (key_nonrec %in% names(cuminc_all)) {
+    idx <- max(which(cuminc_all[[key_nonrec]]$time <= t_5yr))
+    if (is.finite(idx) && idx > 0) cuminc_all[[key_nonrec]]$est[idx] * 100 else 0
+  } else 0
   
   quad_summary_final <- rbind(quad_summary_final, data.frame(
-    `Quadrant Name` = q, `Count_N` = n_q, `Pct` = sprintf("%.1f%%", pct_q),
-    `5-yr OS (95% CI)` = sprintf("%.1f%% (%.1f%%-%.1f%%)", os_5yr, os_lower, os_upper),
-    `5-yr Recurrence CIF` = sprintf("%.1f%%", cif_rec),
+    `Quadrant Name`               = q,
+    `Count_N`                     = n_q,
+    `Pct`                         = sprintf("%.1f%%", pct_q),
+    `5-yr OS (95% CI)`            = sprintf("%.1f%% (%.1f%%-%.1f%%)", os_5yr, os_lower, os_upper),
+    `5-yr Recurrence CIF`         = sprintf("%.1f%%", cif_rec),
     `5-yr Non-recurrent Death CIF` = sprintf("%.1f%%", cif_nonrec),
-    check.names = FALSE
+    check.names = FALSE, stringsAsFactors = FALSE
   ))
 }
+
+cat("\n=== Summary Table: Dual-Score Quadrant Performance ===\n\n")
+print(quad_summary_final, row.names = FALSE)
+cat("\n----------------------------------------------------------------\n")
+cat(sprintf("▸ Overall OS difference (Log-rank p-value): %s\n", format.pval(p_os_overall, eps = 0.001)))
+cat(sprintf("▸ Overall Recurrence CIF difference (Gray's Test p-value): %s\n", format.pval(p_cif_rec_overall, eps = 0.001)))
+cat(sprintf("▸ Overall Non-recurrent Death CIF difference (Gray's Test p-value): %s\n", format.pval(p_cif_nonrec_overall, eps = 0.001)))
+cat("----------------------------------------------------------------\n\n")
 
 # ------------------------------------------------------------------------------
 # 10. Figure 1: Dual-Score Quadrant Framework (2x2 Display)
@@ -548,7 +739,13 @@ get_plot_data <- function(df, q_name) {
   parts <- strsplit(raw_os_ci, " ")[[1]]
   os_main <- parts[1]
   os_ci_str <- paste0("(95% CI: ", gsub("^\\(|\\)$", "", parts[2]), ")")
-  list(n = n_str, os = os_main, ci = os_ci_str, rec = row$`5-yr Recurrence CIF`, nonrec = row$`5-yr Non-recurrent Death CIF`)
+  list(
+    n      = n_str,
+    os     = os_main,
+    ci     = os_ci_str,
+    rec    = row$`5-yr Recurrence CIF`,
+    nonrec = row$`5-yr Non-recurrent Death CIF`
+  )
 }
 
 ll <- get_plot_data(quad_summary_final, "Low-O / Low-S")
@@ -562,13 +759,18 @@ rect_df <- data.frame(
   fill_color = c("#A6D9AC", "#A6D9AC", "#FCD281", "#F7A5A5")
 )
 
-x_ctr_col1 <- (0.08 + 0.98) / 2; x_left_col1 <- 0.11
-x_ctr_col2 <- (1.02 + 1.92) / 2; x_left_col2 <- 1.05
+x_ctr_col1  <- (0.08 + 0.98) / 2
+x_left_col1 <- 0.11
+
+x_ctr_col2  <- (1.02 + 1.92) / 2
+x_left_col2 <- 1.05
 
 p_fig1 <- ggplot() +
-  geom_rect(data = rect_df, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill_color), color = "black", linewidth = 1.2) +
+  geom_rect(data = rect_df, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill_color),
+            color = "black", linewidth = 1.2) +
   scale_fill_identity() +
   
+  # [Bottom-Left] Low O / Low S
   annotate("text", x = x_ctr_col1, y = 0.91, label = "Low O / Low S", fontface = "bold", size = 5.0, hjust = 0.5) +
   annotate("text", x = x_ctr_col1, y = 0.85, label = "(standard resection)", fontface = "italic", size = 3.7, hjust = 0.5) +
   annotate("text", x = x_ctr_col1, y = 0.73, label = ll$n, size = 3.9, hjust = 0.5) +
@@ -579,6 +781,7 @@ p_fig1 <- ggplot() +
   annotate("text", x = x_left_col1, y = 0.20, label = paste0("5-yr CIF non-rec death: ", ll$nonrec), size = 3.3, hjust = 0) +
   annotate("text", x = x_left_col1, y = 0.13, label = "ATT 5-yr RD vs LRST: +20.2 (+7.3, +34.3) pp", fontface = "italic", size = 3.1, hjust = 0) +
   
+  # [Bottom-Right] High O / Low S
   annotate("text", x = x_ctr_col2, y = 0.91, label = "High O / Low S", fontface = "bold", size = 5.0, hjust = 0.5) +
   annotate("text", x = x_ctr_col2, y = 0.85, label = "(oncological futility)", fontface = "italic", size = 3.7, hjust = 0.5) +
   annotate("text", x = x_ctr_col2, y = 0.73, label = hl$n, size = 3.9, hjust = 0.5) +
@@ -589,6 +792,7 @@ p_fig1 <- ggplot() +
   annotate("text", x = x_left_col2, y = 0.20, label = paste0("5-yr CIF non-rec death: ", hl$nonrec), size = 3.3, hjust = 0) +
   annotate("text", x = x_left_col2, y = 0.13, label = "ATT 5-yr RD vs LRST: +6.4 (-5.4, +20.7) pp", fontface = "italic", size = 3.1, hjust = 0) +
   
+  # [Top-Left] Low O / High S
   annotate("text", x = x_ctr_col1, y = 1.87, label = "Low O / High S", fontface = "bold", size = 5.0, hjust = 0.5) +
   annotate("text", x = x_ctr_col1, y = 1.81, label = "(surgical futility)", fontface = "italic", size = 3.7, hjust = 0.5) +
   annotate("text", x = x_ctr_col1, y = 1.69, label = lh$n, size = 3.9, hjust = 0.5) +
@@ -599,6 +803,7 @@ p_fig1 <- ggplot() +
   annotate("text", x = x_left_col1, y = 1.16, label = paste0("5-yr CIF non-rec death: ", lh$nonrec), size = 3.3, hjust = 0) +
   annotate("text", x = x_left_col1, y = 1.09, label = "ATT 5-yr RD vs LRST: +18.8 (+3.7, +34.2) pp", fontface = "italic", size = 3.1, hjust = 0) +
   
+  # [Top-Right] High O / High S
   annotate("text", x = x_ctr_col2, y = 1.87, label = "High O / High S", fontface = "bold", size = 5.0, hjust = 0.5) +
   annotate("text", x = x_ctr_col2, y = 1.81, label = "(doomed)", fontface = "italic", size = 3.7, hjust = 0.5) +
   annotate("text", x = x_ctr_col2, y = 1.69, label = hh$n, size = 3.9, hjust = 0.5) +
@@ -609,8 +814,11 @@ p_fig1 <- ggplot() +
   annotate("text", x = x_left_col2, y = 1.16, label = paste0("5-yr CIF non-rec death: ", hh$nonrec), size = 3.3, hjust = 0) +
   annotate("text", x = x_left_col2, y = 1.09, label = "ATT 5-yr RD vs LRST: +8.3 (-13.8, +46.2) pp", fontface = "italic", size = 3.1, hjust = 0) +
   
-  geom_segment(aes(x = -0.06, xend = 2.02, y = 0, yend = 0), arrow = arrow(length = unit(0.30, "cm"), type = "closed"), linewidth = 1.1) +
-  geom_segment(aes(x = 0, xend = 0, y = -0.06, yend = 2.02), arrow = arrow(length = unit(0.30, "cm"), type = "closed"), linewidth = 1.1) +
+  # Coordinate axes
+  geom_segment(aes(x = -0.06, xend = 2.02, y = 0, yend = 0),
+               arrow = arrow(length = unit(0.30, "cm"), type = "closed"), linewidth = 1.1) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.06, yend = 2.02),
+               arrow = arrow(length = unit(0.30, "cm"), type = "closed"), linewidth = 1.1) +
   annotate("text", x = 1.00, y = -0.13, label = "Oncological risk (O-score) →", fontface = "bold", size = 4.4, hjust = 0.5) +
   annotate("text", x = -0.13, y = 1.00, label = "Surgical risk (S-score) →", fontface = "bold", size = 4.4, hjust = 0.5, vjust = 0.5, angle = 90) +
   
@@ -619,8 +827,10 @@ p_fig1 <- ggplot() +
   scale_y_continuous(limits = c(-0.22, 2.12), expand = c(0, 0)) +
   coord_fixed(clip = "off") +
   theme_void() +
-  theme(plot.title = element_text(size = 13.5, face = "bold", hjust = 0.5, margin = margin(b = 15, t = 10)),
-        plot.margin = margin(15, 15, 15, 15))
+  theme(
+    plot.title  = element_text(size = 13.5, face = "bold", hjust = 0.5, margin = margin(b = 15, t = 10)),
+    plot.margin = margin(15, 15, 15, 15)
+  )
 
 print(p_fig1)
 # ggsave("Figure_1_Dual_Score_Quadrant_Framework.pdf", p_fig1, width = 8.5, height = 8.0, dpi = 300)
