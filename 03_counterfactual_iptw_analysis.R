@@ -80,6 +80,10 @@ df_LRST_scored <- complete(imp_obj_lrst, 1)
 df_LRST_scored$OS_time_5y   <- df_imp_in$OS_time_5y
 df_LRST_scored$OS_status_5y <- df_imp_in$OS_status_5y
 df_LRST_scored$sn           <- df_imp_in$sn
+df_LRST_scored$First_ever   <- df_LRST$First_ever
+
+df_LRST_scored$RFS_time_5y   <- suppressWarnings(as.numeric(df_LRST$RFS_time_5y))
+df_LRST_scored$RFS_status_5y <- suppressWarnings(as.numeric(df_LRST$RFS_status_5y))
 
 # ------------------------------------------------------------------------------
 # 4. Project Resection-Trained Ridge Cox Scores onto LRST Cohort
@@ -330,57 +334,171 @@ cat("\n=== Supplementary Table S6 ===\n")
 print(s6_table, row.names = FALSE)
 
 # ------------------------------------------------------------------------------
-# 9. Figure 2: IPTW-Adjusted Kaplan-Meier Survival Curves
+# 9. IPTW-Adjusted Kaplan–Meier Survival Curves (Figure 2A & 2B)
 # ------------------------------------------------------------------------------
-# [OUTPUT GENERATED: Figure 2]
-dat_km_prep <- dat_pooled %>%
+# [OUTPUT GENERATED: Figure 2A (OS) and Figure 2B (RFS)]
+
+cat("\n══ Section 9: Generating Figure 2A (OS) & Figure 2B (RFS) ══\n")
+
+# Auto-detect analysis dataset (dat_pooled or dat_scored)
+dat_km_base <- if (exists("dat_pooled")) dat_pooled else dat_scored
+
+# Figure 2A: IPTW-Adjusted Overall Survival (OS) Curves across Quadrants
+
+# 1. OS Data Preparation
+dat_km_prep_os <- dat_km_base %>%
   filter(!is.na(quadrant) & !is.na(w_ATT_win) & !is.na(OS_time_5y)) %>%
   mutate(time_yr = if (max(OS_time_5y, na.rm = TRUE) > 10) OS_time_5y / 365.25 else OS_time_5y)
 
-make_single_km_plot_perfect <- function(df, quad_key, panel_title, show_xlab = TRUE, show_ylab = TRUE) {
+# 2. OS KM Plot Generator Function
+make_single_km_os_plot <- function(df, quad_key, panel_title, show_xlab = TRUE, show_ylab = TRUE) {
   sub_df <- df %>% filter(quadrant == quad_key)
-  n_r <- sum(sub_df$trt == 1, na.rm = TRUE); n_l <- sum(sub_df$trt == 0, na.rm = TRUE)
+  n_r <- sum(sub_df$trt == 1, na.rm = TRUE)
+  n_l <- sum(sub_df$trt == 0, na.rm = TRUE)
   
   km_r <- survfit(Surv(time_yr, OS_status_5y) ~ 1, weights = w_ATT_win, data = filter(sub_df, trt == 1))
   km_l <- survfit(Surv(time_yr, OS_status_5y) ~ 1, weights = w_ATT_win, data = filter(sub_df, trt == 0))
   
-  lbl_r <- sprintf("Resection (n=%d)", n_r); lbl_l <- sprintf("LRST (n=%d)", n_l)
+  lbl_r <- sprintf("Resection (n=%d)", n_r)
+  lbl_l <- sprintf("LRST (n=%d)", n_l)
   
   df_plot <- bind_rows(
     data.frame(time = c(0, km_r$time), surv = c(1, km_r$surv) * 100, trt_group = lbl_r),
     data.frame(time = c(0, km_l$time), surv = c(1, km_l$surv) * 100, trt_group = lbl_l)
   ) %>% mutate(trt_group = factor(trt_group, levels = c(lbl_r, lbl_l)))
   
-  color_map <- setNames(c("#1a5fb4", "#c01c28"), c(lbl_r, lbl_l))
-  
   stat_annot <- tryCatch({
-    cox_fit <- coxph(Surv(time_yr, OS_status_5y) ~ trt, data = sub_df, weights = w_ATT_win, robust = TRUE)
-    s_cox   <- summary(cox_fit)
-    hr_val  <- s_cox$coefficients[1, "exp(coef)"]; p_val  <- s_cox$coefficients[1, "Pr(>|z|)"]
-    ci_lo   <- s_cox$conf.int[1, "lower .95"]; ci_hi   <- s_cox$conf.int[1, "upper .95"]
-    p_str   <- if (p_val < 0.001) "p < 0.001" else sprintf("p = %.3f", p_val)
-    sprintf("IPTW HR: %.2f (%.2f–%.2f)\n%s", hr_val, ci_lo, ci_hi, p_str)
+    s_cox <- summary(coxph(Surv(time_yr, OS_status_5y) ~ trt, data = sub_df, weights = w_ATT_win, robust = TRUE))
+    p_val <- s_cox$coefficients[1, "Pr(>|z|)"]
+    p_str <- if (p_val < 0.001) "p < 0.001" else sprintf("p = %.3f", p_val)
+    sprintf("IPTW HR: %.2f (%.2f–%.2f)\n%s", s_cox$coefficients[1, "exp(coef)"], s_cox$conf.int[1, "lower .95"], s_cox$conf.int[1, "upper .95"], p_str)
   }, error = function(e) "")
   
   ggplot(df_plot, aes(x = time, y = surv, color = trt_group)) +
     geom_hline(yintercept = 50, linetype = "dashed", color = "#a1a1a1", linewidth = 0.5) +
     geom_step(linewidth = 0.95, alpha = 0.95) +
     annotate("text", x = 4.85, y = 18, label = stat_annot, hjust = 1, vjust = 0, size = 3.2, fontface = "bold", color = "#222222") +
-    scale_color_manual(values = color_map) +
+    scale_color_manual(values = setNames(c("#1a5fb4", "#c01c28"), c(lbl_r, lbl_l))) +
     scale_x_continuous(limits = c(0, 5), breaks = 0:5, expand = c(0.005, 0.005)) +
     scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 20), expand = c(0.005, 0.005)) +
-    labs(title = panel_title, x = if (show_xlab) "Years from first HCC-directed therapy" else NULL, y = if (show_ylab) "IPTW-adjusted overall survival (%)" else NULL) +
+    labs(
+      title = panel_title,
+      x     = if (show_xlab) "Years from first HCC-directed therapy" else NULL,
+      y     = if (show_ylab) "IPTW-adjusted overall survival (%)" else NULL
+    ) +
     theme_bw(base_size = 11) +
-    theme(plot.title = element_text(size = 10.5, face = "bold", hjust = 0.5), legend.position = c(0.03, 0.05), legend.justification = c(0, 0))
+    theme(
+      plot.title       = element_text(size = 10.5, face = "bold", hjust = 0.5, color = "black", margin = margin(b = 6)),
+      panel.grid.major = element_line(color = "#f2f2f2", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      panel.border      = element_rect(color = "black", fill = NA, linewidth = 0.7),
+      axis.text        = element_text(size = 9.5, color = "black"),
+      axis.title       = element_text(size = 10.5, color = "black"),
+      axis.title.y     = element_text(margin = margin(r = 6)),
+      axis.title.x     = element_text(margin = margin(t = 6)),
+      legend.position  = c(0.03, 0.05),
+      legend.justification = c(0, 0),
+      legend.background = element_blank(),
+      legend.key        = element_blank(),
+      legend.key.width  = unit(1.2, "line"),
+      legend.text       = element_text(size = 9.2, face = "bold", color = "#222222"),
+      legend.spacing.y  = unit(0.08, "cm"),
+      legend.title      = element_blank()
+    )
 }
 
-p_tl <- make_single_km_plot_perfect(dat_km_prep, "Low-O / High-S", "Low O / High S (surgical futility)", FALSE, TRUE)
-p_tr <- make_single_km_plot_perfect(dat_km_prep, "High-O / High-S", "High O / High S (doomed)", FALSE, FALSE)
-p_bl <- make_single_km_plot_perfect(dat_km_prep, "Low-O / Low-S", "Low O / Low S (standard resection)", TRUE, TRUE)
-p_br <- make_single_km_plot_perfect(dat_km_prep, "High-O / Low-S", "High O / Low S (oncological futility)", TRUE, FALSE)
+# 3. Assemble Figure 2A (OS) Panels
+p_os_tl <- make_single_km_os_plot(dat_km_prep_os, "Low-O / High-S", "Low O / High S (surgical futility)", FALSE, TRUE)
+p_os_tr <- make_single_km_os_plot(dat_km_prep_os, "High-O / High-S", "High O / High S (doomed)", FALSE, FALSE)
+p_os_bl <- make_single_km_os_plot(dat_km_prep_os, "Low-O / Low-S", "Low O / Low S (standard resection)", TRUE, TRUE)
+p_os_br <- make_single_km_os_plot(dat_km_prep_os, "High-O / Low-S", "High O / Low S (oncological futility)", TRUE, FALSE)
 
-p_fig2_final <- (p_tl | p_tr) / (p_bl | p_br) + plot_annotation(title = "IPTW-adjusted Kaplan–Meier survival by O/S quadrant (resection vs LRST)")
-print(p_fig2_final)
+p_fig2a_os <- (p_os_tl | p_os_tr) / (p_os_bl | p_os_br) +
+  plot_annotation(
+    title = "Figure 2A. IPTW-adjusted overall survival by O/S quadrant (resection vs LRST)",
+    theme = theme(plot.title = element_text(size = 13.5, face = "bold", hjust = 0.5, color = "black", margin = margin(b = 10, t = 5)))
+  )
+
+print(p_fig2a_os)
+
+
+# Figure 2B: IPTW-Adjusted Recurrence-Free Survival (RFS) Curves across Quadrants
+
+# 1. RFS Data Preparation
+dat_km_prep_rfs <- dat_km_base %>%
+  filter(!is.na(quadrant) & !is.na(w_ATT_win) & !is.na(RFS_time_5y)) %>%
+  mutate(time_yr = if (max(RFS_time_5y, na.rm = TRUE) > 10) RFS_time_5y / 365.25 else RFS_time_5y)
+
+# 2. RFS KM Plot Generator Function
+make_single_km_rfs_plot <- function(df, quad_key, panel_title, show_xlab = TRUE, show_ylab = TRUE) {
+  sub_df <- df %>% filter(quadrant == quad_key)
+  n_r <- sum(sub_df$trt == 1, na.rm = TRUE)
+  n_l <- sum(sub_df$trt == 0, na.rm = TRUE)
+  
+  km_r <- survfit(Surv(time_yr, RFS_status_5y) ~ 1, weights = w_ATT_win, data = filter(sub_df, trt == 1))
+  km_l <- survfit(Surv(time_yr, RFS_status_5y) ~ 1, weights = w_ATT_win, data = filter(sub_df, trt == 0))
+  
+  lbl_r <- sprintf("Resection (n=%d)", n_r)
+  lbl_l <- sprintf("LRST (n=%d)", n_l)
+  
+  df_plot <- bind_rows(
+    data.frame(time = c(0, km_r$time), surv = c(1, km_r$surv) * 100, trt_group = lbl_r),
+    data.frame(time = c(0, km_l$time), surv = c(1, km_l$surv) * 100, trt_group = lbl_l)
+  ) %>% mutate(trt_group = factor(trt_group, levels = c(lbl_r, lbl_l)))
+  
+  stat_annot <- tryCatch({
+    s_cox <- summary(coxph(Surv(time_yr, RFS_status_5y) ~ trt, data = sub_df, weights = w_ATT_win, robust = TRUE))
+    p_val <- s_cox$coefficients[1, "Pr(>|z|)"]
+    p_str <- if (p_val < 0.001) "p < 0.001" else sprintf("p = %.3f", p_val)
+    sprintf("IPTW HR: %.2f (%.2f–%.2f)\n%s", s_cox$coefficients[1, "exp(coef)"], s_cox$conf.int[1, "lower .95"], s_cox$conf.int[1, "upper .95"], p_str)
+  }, error = function(e) "")
+  
+  ggplot(df_plot, aes(x = time, y = surv, color = trt_group)) +
+    geom_hline(yintercept = 50, linetype = "dashed", color = "#a1a1a1", linewidth = 0.5) +
+    geom_step(linewidth = 0.95, alpha = 0.95) +
+    annotate("text", x = 4.85, y = 18, label = stat_annot, hjust = 1, vjust = 0, size = 3.2, fontface = "bold", color = "#222222") +
+    scale_color_manual(values = setNames(c("#1a5fb4", "#c01c28"), c(lbl_r, lbl_l))) +
+    scale_x_continuous(limits = c(0, 5), breaks = 0:5, expand = c(0.005, 0.005)) +
+    scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 20), expand = c(0.005, 0.005)) +
+    labs(
+      title = panel_title,
+      x     = if (show_xlab) "Years from first HCC-directed therapy" else NULL,
+      y     = if (show_ylab) "IPTW-adjusted recurrence-free survival (%)" else NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title       = element_text(size = 10.5, face = "bold", hjust = 0.5, color = "black", margin = margin(b = 6)),
+      panel.grid.major = element_line(color = "#f2f2f2", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      panel.border      = element_rect(color = "black", fill = NA, linewidth = 0.7),
+      axis.text        = element_text(size = 9.5, color = "black"),
+      axis.title       = element_text(size = 10.5, color = "black"),
+      axis.title.y     = element_text(margin = margin(r = 6)),
+      axis.title.x     = element_text(margin = margin(t = 6)),
+      legend.position  = c(0.03, 0.05),
+      legend.justification = c(0, 0),
+      legend.background = element_blank(),
+      legend.key        = element_blank(),
+      legend.key.width  = unit(1.2, "line"),
+      legend.text       = element_text(size = 9.2, face = "bold", color = "#222222"),
+      legend.spacing.y  = unit(0.08, "cm"),
+      legend.title      = element_blank()
+    )
+}
+
+# 3. Assemble Figure 2B (RFS) Panels
+p_rfs_tl <- make_single_km_rfs_plot(dat_km_prep_rfs, "Low-O / High-S", "Low O / High S (surgical futility)", FALSE, TRUE)
+p_rfs_tr <- make_single_km_rfs_plot(dat_km_prep_rfs, "High-O / High-S", "High O / High S (doomed)", FALSE, FALSE)
+p_rfs_bl <- make_single_km_rfs_plot(dat_km_prep_rfs, "Low-O / Low-S", "Low O / Low S (standard resection)", TRUE, TRUE)
+p_rfs_br <- make_single_km_rfs_plot(dat_km_prep_rfs, "High-O / Low-S", "High O / Low S (oncological futility)", TRUE, FALSE)
+
+p_fig2b_rfs <- (p_rfs_tl | p_rfs_tr) / (p_rfs_bl | p_rfs_br) +
+  plot_annotation(
+    title = "Figure 2B. IPTW-adjusted recurrence-free survival by O/S quadrant (resection vs LRST)",
+    theme = theme(plot.title = element_text(size = 13.5, face = "bold", hjust = 0.5, color = "black", margin = margin(b = 10, t = 5)))
+  )
+
+print(p_fig2b_rfs)
 
 # ------------------------------------------------------------------------------
 # 10. Table 3: Primary Counterfactual Outcomes Assembly
@@ -390,23 +508,31 @@ phenotype_map <- c(
   "Low-O / Low-S"   = "Standard resection",
   "High-O / Low-S"  = "Oncological futility",
   "Low-O / High-S"  = "Surgical futility",
-  "High-O / High-S" = "Doomed"
+  "High-O / High-S" = "Dual elevation"
 )
 
 table3_observed <- quad_summary_final %>%
   mutate(
-    Quadrant = `Quadrant Name`, Phenotype = phenotype_map[`Quadrant Name`],
-    `n (% of cohort)` = sprintf("%s (%s)", format(Count_N, big.mark = ","), Pct),
-    `Observed 5-yr OS` = gsub(" .*", "", `5-yr OS (95% CI)`),
-    `5-yr CIF recurrence` = `5-yr Recurrence CIF`,
+    Quadrant                      = as.character(`Quadrant Name`),
+    Phenotype                     = unname(phenotype_map[as.character(`Quadrant Name`)]),
+    `n (% of cohort)`             = sprintf("%s (%s)", format(Count_N, big.mark = ","), Pct),
+    `Observed 5-yr OS`            = gsub(" .*", "", `5-yr OS (95% CI)`),
+    `5-yr CIF recurrence`         = `5-yr Recurrence CIF`,
     `5-yr CIF non-recurrent death` = `5-yr Non-recurrent Death CIF`
   ) %>%
-  select(Quadrant, Phenotype, `n (% of cohort)`, `Observed 5-yr OS`, `5-yr CIF recurrence`, `5-yr CIF non-recurrent death`)
+  select(
+    Quadrant, Phenotype, `n (% of cohort)`, 
+    `Observed 5-yr OS`, `5-yr CIF recurrence`, `5-yr CIF non-recurrent death`
+  )
 
 table3_att <- fig1_results %>%
-  mutate(Quadrant = quadrant, `ATT 5-yr RD vs LRST (95% CI)` = sprintf("%+.1f (%+.1f, %+.1f)", OS_diff_pp, CI_lo, CI_hi)) %>%
-  select(Quadrant, `ATT 5-yr RD vs LRST (95% CI)`)
-
+  mutate(
+    Quadrant                      = as.character(quadrant),
+    `LRST Comparator, n (ESS)`    = sprintf("%d (%.1f)", n_lrst, ess_lrst),
+    `ATT 5-yr RD vs LRST (95% CI)` = sprintf("%+.1f (%+.1f, %+.1f)", OS_diff_pp, CI_lo, CI_hi)
+  ) %>%
+  select(Quadrant, `LRST Comparator, n (ESS)`, `ATT 5-yr RD vs LRST (95% CI)`)
+      
 table3_final <- table3_observed %>% left_join(table3_att, by = "Quadrant")
 
 cat("\n=== Table 3. Main Cohort Outcomes and ATT 5-Year Risk Differences ===\n")
@@ -416,61 +542,122 @@ print(table3_final, row.names = FALSE)
 # 11. Supplementary Table S3: Multi-Year Bootstrap Treatment Effect Estimates
 # ------------------------------------------------------------------------------
 # [OUTPUT GENERATED: Supplementary Table S3]
-generate_supp_table_s3_boot <- function(df, n_boot = 500, seed = 123) {
+generate_supp_table_s3_standard <- function(df, ps_formula, n_boot = 1000, seed = 2026) {
+  
   set.seed(seed)
-  df_prep <- df %>% filter(!is.na(quadrant) & !is.na(w_ATT_win) & !is.na(OS_time_5y)) %>%
-    mutate(time_yr = if (max(OS_time_5y, na.rm = TRUE) > 10) OS_time_5y / 365.25 else OS_time_5y)
+  horizons_days  <- c(2 * 365.25, 3 * 365.25, 5 * 365.25) # 2y, 3y, 5y in days
+  horizon_labels <- c(2, 3, 5)
+  quads          <- levels(df$quadrant)
   
-  horizons <- c(2, 3, 5); quads <- levels(df_prep$quadrant)
-  
-  calc_point_rd <- function(sub_data, t_horizon) {
-    d_res  <- sub_data %>% filter(trt == 1); d_lrst <- sub_data %>% filter(trt == 0)
-    get_os_pct <- function(d) {
+  # Helper function: Calculate point RD at time t
+  calc_quad_rd_at_t <- function(sub_df, t_days) {
+    get_os <- function(trt_val) {
+      d <- sub_df %>% filter(trt == trt_val)
       if (nrow(d) < 2) return(NA_real_)
-      km <- tryCatch(survfit(Surv(time_yr, OS_status_5y) ~ 1, weights = w_ATT_win, data = d), error = function(e) NULL)
+      
+      km <- tryCatch(
+        survfit(Surv(OS_time_5y, OS_status_5y) ~ 1, weights = d$w_ATT_win, data = d),
+        error = function(e) NULL
+      )
       if (is.null(km)) return(NA_real_)
-      s_sum <- summary(km, times = t_horizon, extend = TRUE)
-      if (length(s_sum$surv) > 0) return(s_sum$surv[1] * 100) else return(NA_real_)
+      
+      s_sum <- summary(km, times = t_days, extend = TRUE)
+      if (length(s_sum$surv) > 0) s_sum$surv[1] * 100 else NA_real_
     }
-    os_r <- get_os_pct(d_res); os_l <- get_os_pct(d_lrst)
+    
+    os_r <- get_os(1)
+    os_l <- get_os(0)
     if (!is.na(os_r) && !is.na(os_l)) os_r - os_l else NA_real_
   }
   
-  final_rows <- list()
+  # 1. Point Estimates on Original Data
+  point_list <- list()
   for (q in quads) {
-    sub_q <- df_prep %>% filter(quadrant == q)
-    for (h in horizons) {
-      rd_point <- calc_point_rd(sub_q, h)
-      boot_rds <- numeric(n_boot)
-      sub_res <- sub_q %>% filter(trt == 1); sub_lrst <- sub_q %>% filter(trt == 0)
-      n_res <- nrow(sub_res); n_lrst <- nrow(sub_lrst)
-      
-      for (b in 1:n_boot) {
-        boot_res  <- sub_res[sample(1:n_res, size = n_res, replace = TRUE), ]
-        boot_lrst <- sub_lrst[sample(1:n_lrst, size = n_lrst, replace = TRUE), ]
-        boot_sub  <- bind_rows(boot_res, boot_lrst)
-        boot_rds[b] <- calc_point_rd(boot_sub, h)
-      }
-      valid_boots <- boot_rds[!is.na(boot_rds)]
-      ci_lo <- quantile(valid_boots, probs = 0.025, na.rm = TRUE)
-      ci_hi <- quantile(valid_boots, probs = 0.975, na.rm = TRUE)
-      
-      final_rows[[length(final_rows) + 1]] <- data.frame(Quadrant = q, horizon_y = h, RD_pp = rd_point, RD_lo_95 = as.numeric(ci_lo), RD_hi_95 = as.numeric(ci_hi), n_boot = n_boot, stringsAsFactors = FALSE)
+    sub_q <- df %>% filter(quadrant == q & !is.na(w_ATT_win))
+    for (i in seq_along(horizons_days)) {
+      rd_val <- calc_quad_rd_at_t(sub_q, horizons_days[i])
+      point_list[[paste(q, horizon_labels[i], sep = "_")]] <- rd_val
     }
   }
-  raw_df <- bind_rows(final_rows)
-  formatted_df <- raw_df %>%
-    mutate(
-      Quadrant = gsub(" / ", "/", Quadrant), `Horizon (Years)` = horizon_y,
-      `ATT RD (Percentage Points)` = sprintf("%+.1f", RD_pp), `95% Bootstrap CI` = sprintf("%+.1f to %+.1f", RD_lo_95, RD_hi_95), `n_boot` = n_boot
-    ) %>%
-    select(Quadrant, `Horizon (Years)`, `ATT RD (Percentage Points)`, `95% Bootstrap CI`, `n_boot`)
-  return(list(formatted = formatted_df, raw = raw_df))
+  
+  # 2. Stratified Bootstrap with PS Model Re-fitting (1000 Replicates)
+  cat(sprintf("── Running Stratified Bootstrap-%d with PS model re-fitting...\n", n_boot))
+  
+  matrix_cols <- names(point_list)
+  boot_mat    <- matrix(NA, nrow = n_boot, ncol = length(matrix_cols))
+  colnames(boot_mat) <- matrix_cols
+  
+  for (b in seq_len(n_boot)) {
+    # Stratified resample by quadrant x treatment
+    boot_df <- df %>%
+      group_by(quadrant, trt) %>%
+      slice_sample(prop = 1, replace = TRUE) %>%
+      ungroup()
+    
+    # Re-fit Propensity Score model and update ATT weights
+    ps_b <- tryCatch({
+      suppressWarnings({
+        m_b <- glm(ps_formula, data = boot_df, family = binomial(link = "logit"))
+        predict(m_b, newdata = boot_df, type = "response")
+      })
+    }, error = function(e) boot_df$ps)
+    
+    ps_b_clean        <- pmin(pmax(ps_b, 0.01), 0.99)
+    w_ATT_b_raw       <- ifelse(boot_df$trt == 1, 1.0, ps_b_clean / (1 - ps_b_clean))
+    boot_df$w_ATT_win <- pmin(w_ATT_b_raw, quantile(w_ATT_b_raw, 0.99, na.rm = TRUE))
+    
+    # Calculate RD for each quadrant and horizon in bootstrap sample
+    for (q in quads) {
+      sub_q_b <- boot_df %>% filter(quadrant == q)
+      for (i in seq_along(horizons_days)) {
+        col_key <- paste(q, horizon_labels[i], sep = "_")
+        boot_mat[b, col_key] <- calc_quad_rd_at_t(sub_q_b, horizons_days[i])
+      }
+    }
+    
+    if (b %% 200 == 0) cat(sprintf("   Bootstrap %d/%d completed\n", b, n_boot))
+  }
+  
+  # 3. Assemble Supplementary Table S3
+  results_list <- list()
+  for (q in quads) {
+    for (i in seq_along(horizons_days)) {
+      col_key <- paste(q, horizon_labels[i], sep = "_")
+      
+      rd_point  <- point_list[[col_key]]
+      boot_vals <- boot_mat[, col_key]
+      boot_vals <- boot_vals[!is.na(boot_vals)]
+      
+      ci_lo <- quantile(boot_vals, probs = 0.025, na.rm = TRUE)
+      ci_hi <- quantile(boot_vals, probs = 0.975, na.rm = TRUE)
+      
+      results_list[[length(results_list) + 1]] <- data.frame(
+        Quadrant                      = gsub(" / ", "/", q),
+        `Horizon (Years)`            = horizon_labels[i],
+        `ATT RD (Percentage Points)` = sprintf("%+.1f", rd_point),
+        `95% Bootstrap CI`           = sprintf("%+.1f to %+.1f", ci_lo, ci_hi),
+        `n_boot`                     = n_boot,
+        check.names                  = FALSE,
+        stringsAsFactors             = FALSE
+      )
+    }
+  }
+  
+  bind_rows(results_list)
 }
 
-supp_s3_output <- generate_supp_table_s3_boot(dat_pooled, n_boot = 500, seed = 123)
-cat("\n=== Supplementary Table S3 ===\n")
-print(supp_s3_output$formatted, row.names = FALSE)
+# Run and format output
+dat_supp_base <- if (exists("dat_pooled")) dat_pooled else dat_scored
+
+supp_table_s3_final <- generate_supp_table_s3_standard(
+  df         = dat_supp_base, 
+  ps_formula = ps_formula, 
+  n_boot     = 1000, 
+  seed       = 2026
+)
+
+cat("\n=== Supplementary Table S3. Multi-Year Bootstrap Treatment Effect Estimates ===\n\n")
+print(supp_table_s3_final, row.names = FALSE)
 
 # ------------------------------------------------------------------------------
 # 12. Supplementary Tables S4 & S5: Sensitivity Analyses
